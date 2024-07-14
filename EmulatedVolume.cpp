@@ -16,6 +16,8 @@
 
 #include "EmulatedVolume.h"
 #include "Utils.h"
+/* SPRD: add for emulated storage */
+#include "VolumeManager.h"
 
 #include <base/stringprintf.h>
 #include <base/logging.h>
@@ -57,7 +59,12 @@ status_t EmulatedVolume::doMount() {
     // We could have migrated storage to an adopted private volume, so always
     // call primary storage "emulated" to avoid media rescans.
     std::string label = mLabel;
+    /* SPRD: modify for emulated storage @{
+     * @orig
     if (getMountFlags() & MountFlags::kPrimary) {
+     */
+    if (getMountFlags() & (MountFlags::kPrimary | MountFlags::kPriEmu)) {
+    /* @} */
         label = "emulated";
     }
 
@@ -112,6 +119,12 @@ status_t EmulatedVolume::doUnmount() {
         TEMP_FAILURE_RETRY(waitpid(mFusePid, nullptr, 0));
         mFusePid = 0;
     }
+
+    /* SPRD: add for emulated storage @{ */
+    if (getMountFlags() & MountFlags::kPriEmu) {
+        VolumeManager::Instance()->clearEmulated();
+    }
+    /* @} */
 
     ForceUnmount(mFuseDefault);
     ForceUnmount(mFuseRead);

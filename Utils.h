@@ -88,11 +88,22 @@ bool IsFilesystemSupported(const std::string& fsType);
 /* Wipes contents of block device at given path */
 status_t WipeBlockDevice(const std::string& path);
 
+status_t getBlkDeviceSize(const std::string& path,  unsigned long long & size64);
+
 std::string BuildKeyPath(const std::string& partGuid);
 
 dev_t GetDevice(const std::string& path);
 
 std::string DefaultFstabPath();
+
+/* SPRD: add for storage @{ */
+/*  create symlink  */
+status_t CreateSymlink(const std::string& source, const std::string& target);
+/*  delete symlink  */
+status_t DeleteSymlink(const std::string& path);
+/*  write string to file  */
+status_t WriteToFile(const std::string& preMsg, const std::string& file, const std::string& str, const char byte);
+/* @} */
 
 }  // namespace vold
 }  // namespace android

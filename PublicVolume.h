@@ -48,6 +48,13 @@ protected:
     status_t doMount() override;
     status_t doUnmount() override;
     status_t doFormat(const std::string& fsType) override;
+    /* SPRD: add for read storage metadata */
+    status_t doGetMetadata() override;
+    /* SPRD: add for UMS @{ */
+    status_t doShare(const std::string& massStorageFilePath) override;
+    status_t doUnshare() override;
+    status_t doSetState(State state) override;
+    /* @} */
 
     status_t readMetadata();
     status_t initAsecStage();
@@ -73,6 +80,10 @@ private:
     std::string mFsUuid;
     /* User-visible filesystem label */
     std::string mFsLabel;
+
+    /* SPRD: add for UMS @{ */
+    std::string mMassStorageFilePath;
+    /* @} */
 
     DISALLOW_COPY_AND_ASSIGN(PublicVolume);
 };

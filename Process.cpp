@@ -63,6 +63,12 @@ int Process::pathMatchesMountPoint(const char* path, const char* mountPoint) {
     return 0;
 }
 
+/* SPRD: Add for boot performance in cryptfs mode {@  */
+extern "C" void vold_getProcessName(int pid, char *buffer, size_t max) {
+   Process::getProcessName(pid, buffer, max);
+}
+/* @} */
+
 void Process::getProcessName(int pid, char *buffer, size_t max) {
     int fd;
     snprintf(buffer, max, "/proc/%d/cmdline", pid);
@@ -79,6 +85,17 @@ void Process::getProcessName(int pid, char *buffer, size_t max) {
 int Process::checkFileDescriptorSymLinks(int pid, const char *mountPoint) {
     return checkFileDescriptorSymLinks(pid, mountPoint, NULL, 0);
 }
+
+/* SPRD: Add for boot performance in cryptfs mode {@ */
+extern "C" int vold_checkFileDescriptorSymLinks(int pid, const char *mountPoint, char *openFilename, size_t max) {
+    return Process::checkFileDescriptorSymLinks(pid, mountPoint, openFilename, max);
+}
+
+extern "C" int vold_checkSymLink(int pid, const char *mountPoint, const char *name) {
+    return Process::checkSymLink(pid, mountPoint, name);
+}
+
+/* @} */
 
 int Process::checkFileDescriptorSymLinks(int pid, const char *mountPoint, char *openFilename, size_t max) {
 
@@ -161,6 +178,12 @@ int Process::checkSymLink(int pid, const char *mountPoint, const char *name) {
     return 0;
 }
 
+/* SPRD: Add for boot performance in cryptfs mode {@ */
+extern "C" int vold_getPid(const char *s) {
+    return Process::getPid(s);
+}
+/* @} */
+
 int Process::getPid(const char *s) {
     int result = 0;
     while (*s) {
@@ -177,13 +200,17 @@ extern "C" void vold_killProcessesWithOpenFiles(const char *path, int signal) {
 /*
  * Hunt down processes that have files open at the given mount point.
  */
-void Process::killProcessesWithOpenFiles(const char *path, int signal) {
+// SPRD: support double sdcard change return type from "void" to "bool"
+bool Process::killProcessesWithOpenFiles(const char *path, int signal) {
     DIR*    dir;
     struct dirent* de;
+    /* SPRD: support double sdcard do not kill system_server process with signal SIGTERM@{ */
+    bool value = true;
+    /* @} */
 
     if (!(dir = opendir("/proc"))) {
         SLOGE("opendir failed (%s)", strerror(errno));
-        return;
+        return value; // SPRD: support double sdcard return line add "value"
     }
 
     while ((de = readdir(dir))) {
@@ -209,11 +236,30 @@ void Process::killProcessesWithOpenFiles(const char *path, int signal) {
         } else {
             continue;
         }
-
+        /* SPRD: support double sdcard kill slog process force when unmount sd card for performance @{ */
+        if(!strcmp(name, "/system/bin/slog") || !strcmp(name, "/system/bin/slogmodem")){
+            SLOGE("Sending SIGKILL to %s process %d", name , pid);
+            kill(pid, SIGKILL);
+            continue;
+        }
+        /* @} */
         if (signal != 0) {
-            SLOGW("Sending %s to process %d", strsignal(signal), pid);
-            kill(pid, signal);
+          /* SPRD: support double sdcard do not kill system_server process with signal SIGTERM @{ */
+          if (!strcmp(name, "system_server")) {
+              SLOGW("Process name is system_server, do not kill \n");
+              if(signal == SIGKILL) value = false;
+              continue;
+          }else {
+              SLOGW("vold:Sending %s to process %s (%d)", strsignal(signal), name, pid);
+                /* @} */
+              SLOGW("Sending %s to process %d", strsignal(signal), pid);
+              kill(pid, signal);
+          /* SPRD: support double sdcard do not kill system_server process with signal SIGTERM @{ */
+           }
+           /* @} */
         }
     }
     closedir(dir);
+    // SPRD: support double sdcard add return "value"
+    return value;
 }

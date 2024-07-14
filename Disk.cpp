@@ -76,10 +76,18 @@ enum class Table {
     kGpt,
 };
 
+/* SPRD: modify for physical internal SD @{
+ * @orig
 Disk::Disk(const std::string& eventPath, dev_t device,
         const std::string& nickname, int flags) :
         mDevice(device), mSize(-1), mNickname(nickname), mFlags(flags), mCreated(
                 false), mJustPartitioned(false) {
+ */
+Disk::Disk(const std::string& eventPath, dev_t device,
+        const std::string& nickname, const std::string& partname, int flags) :
+        mDevice(device), mSize(-1), mNickname(nickname), mFlags(flags), mCreated(
+                false), mJustPartitioned(false), mPartname(partname) {
+/* @} */
     mId = StringPrintf("disk:%u,%u", major(device), minor(device));
     mEventPath = eventPath;
     mSysPath = StringPrintf("/sys/%s", eventPath.c_str());
@@ -120,6 +128,12 @@ status_t Disk::create() {
     notifyEvent(ResponseCode::DiskCreated, StringPrintf("%d", mFlags));
     readMetadata();
     readPartitions();
+    /* SPRD: add for usb otg @{ */
+    if (mNickname == "usbdisk") {
+        LOG(DEBUG) << StringPrintf("start check thread for usbdisk:%u,%u", major(mDevice), minor(mDevice));
+        startDiskCheckThread();
+    }
+    /* @} */
     return OK;
 }
 
@@ -128,8 +142,35 @@ status_t Disk::destroy() {
     destroyAllVolumes();
     mCreated = false;
     notifyEvent(ResponseCode::DiskDestroyed);
+    /* SPRD: add for usb otg @{ */
+    if (mNickname == "usbdisk") {
+        LOG(DEBUG) << StringPrintf("stop check thread for usbdisk:%u,%u", major(mDevice), minor(mDevice));
+        stopDiskCheckThread();
+    }
+    /* @} */
     return OK;
 }
+
+/* SPRD: add for set link name @{ */
+status_t Disk::setVolLinkName(int partIndex, const std::shared_ptr<VolumeBase> volume) {
+    auto vol = volume;
+    std::string linkName;
+    if (!mPartname.empty()) {
+        linkName = mNickname;
+        mThePartVol = vol;
+    } else {
+        if (partIndex == 0 || partIndex == 1) {
+            linkName = mNickname;
+        } else {
+            linkName = StringPrintf("%s%d", mNickname.c_str(), partIndex);
+        }
+    }
+    LOG(DEBUG) << StringPrintf("createVolume partName is %s, partIndex is %d, linkName is %s",
+                               mPartname.c_str(), partIndex, linkName.c_str());
+    vol->setLinkName(linkName);
+    return OK;
+}
+/* @} */
 
 void Disk::createPublicVolume(dev_t device) {
     auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(device));
@@ -143,6 +184,10 @@ void Disk::createPublicVolume(dev_t device) {
     }
 
     mVolumes.push_back(vol);
+    /* SPRD: add for set link name for mount path @{ */
+    int partIndex = minor(device) - minor(mDevice);
+    setVolLinkName(partIndex, vol);
+    /* @} */
     vol->setDiskId(getId());
     vol->create();
 }
@@ -173,6 +218,10 @@ void Disk::createPrivateVolume(dev_t device, const std::string& partGuid) {
     }
 
     mVolumes.push_back(vol);
+    /* SPRD: add for set link name @{ */
+    int partIndex = minor(device) - minor(mDevice);
+    setVolLinkName(partIndex, vol);
+    /* @} */
     vol->setDiskId(getId());
     vol->setPartGuid(partGuid);
     vol->create();
@@ -294,7 +343,10 @@ status_t Disk::readPartitions() {
                 const char* type = strtok(nullptr, kSgdiskToken);
 
                 switch (strtol(type, nullptr, 16)) {
+                case 0x01: // FAT32
+                case 0x04: // FAT16 < 32MB
                 case 0x06: // FAT16
+                case 0x07: // HPFS/NTFS/EXFAT
                 case 0x0b: // W95 FAT32 (LBA)
                 case 0x0c: // W95 FAT32 (LBA)
                 case 0x0e: // W95 FAT16 (LBA)
@@ -304,7 +356,15 @@ status_t Disk::readPartitions() {
             } else if (table == Table::kGpt) {
                 const char* typeGuid = strtok(nullptr, kSgdiskToken);
                 const char* partGuid = strtok(nullptr, kSgdiskToken);
+                /* SPRD: add for physical internal SD @{ */
+                const char* partName = strtok(nullptr, kSgdiskToken);
 
+                if (!mPartname.empty()) {
+                    if (mPartname == partName) {
+                        createPublicVolume(partDevice);
+                    }
+                } else
+                /* @} */
                 if (!strcasecmp(typeGuid, kGptBasicData)) {
                     createPublicVolume(partDevice);
                 } else if (!strcasecmp(typeGuid, kGptAndroidExpand)) {
@@ -339,7 +399,32 @@ status_t Disk::unmountAll() {
     return OK;
 }
 
+/* SPRD: add for physical internal SD @{ */
+status_t Disk::formatThePart() {
+    auto vol = mThePartVol;
+
+    LOG(DEBUG) << "silently formatting the partition";
+    vol->destroy();
+    vol->setSilent(true);
+    vol->create();
+    vol->format("auto");
+    vol->destroy();
+    vol->setSilent(false);
+    vol->create();
+
+    return OK;
+}
+/* @} */
+
 status_t Disk::partitionPublic() {
+    /* SPRD: add for physical internal SD @{ */
+    if (!mPartname.empty()) {
+        LOG(ERROR) << "this disk not support partition public, we just format the partition instead!";
+        status_t res = formatThePart();
+        notifyEvent(ResponseCode::DiskScanned);
+        return res;
+    }
+    /* @} */
     // TODO: improve this code
     destroyAllVolumes();
     mJustPartitioned = true;
@@ -387,6 +472,13 @@ status_t Disk::partitionPrivate() {
 
 status_t Disk::partitionMixed(int8_t ratio) {
     int res;
+
+    /* SPRD: add for physical internal SD @{ */
+    if (!mPartname.empty()) {
+        LOG(ERROR) << "this disk not support partition private or mixed!";
+        return -EINVAL;
+    }
+    /* @} */
 
     destroyAllVolumes();
     mJustPartitioned = true;
@@ -498,6 +590,65 @@ int Disk::getMaxMinors() {
     LOG(ERROR) << "Unsupported block major type " << major(mDevice);
     return -ENOTSUP;
 }
+
+
+/* SPRD: add for usb otg @{ */
+/* check thread run function */
+void *Disk::diskCheck(void *arg) {
+    Disk *disk = (Disk *)arg;
+    const char *devPath = disk->mDevPath.c_str();
+    int fd;
+
+    while (1) {
+        LOG(DEBUG) << "open device " << devPath;
+        fd = open(devPath, O_RDONLY, 0);
+        if (fd <= 0) {
+            PLOG(ERROR) << StringPrintf("wait for USB OTG device %s ready", devPath);
+        } else {
+            LOG(DEBUG) << StringPrintf("USB OTG device %s is ready.", devPath);
+            close(fd);
+        }
+        if (disk->mCtlStopCheckThread) {
+            LOG(DEBUG) << "mCtlStopCheckThread is true, stop disk check thread.";
+            break;
+        }
+        sleep(1);
+    }
+
+    disk->mCtlStopCheckThread = false;
+    disk->mDiskCheckThreadID = 0;
+    return NULL;
+}
+
+/* start check disk thread */
+void Disk::startDiskCheckThread() {
+    if (mDiskCheckThreadID != 0) {
+        LOG(DEBUG) << "disk check thread is already running.";
+        return;
+    }
+
+    mCtlStopCheckThread = false;
+    if (pthread_create(&mDiskCheckThreadID, NULL, Disk::diskCheck, (void *)this)) {
+        PLOG(ERROR) << "disk check thread create error";
+        mDiskCheckThreadID = 0;
+    }
+}
+
+/* stop check disk thread */
+void Disk::stopDiskCheckThread() {
+    int err = 0;
+
+    if (mDiskCheckThreadID == 0) {
+        LOG(DEBUG) << "disk check thread have not start.";
+        return;
+    }
+
+    mCtlStopCheckThread = true;
+    LOG(DEBUG) << "wait cancel disk check thread";
+    err = pthread_join(mDiskCheckThreadID, NULL);
+    LOG(DEBUG) << StringPrintf("stop disk check thread over: %d", err);
+}
+/* @} */
 
 }  // namespace vold
 }  // namespace android

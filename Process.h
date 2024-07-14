@@ -21,7 +21,11 @@
 
 class Process {
 public:
-    static void killProcessesWithOpenFiles(const char *path, int signal);
+    /* SPRD: support double sdcard do not kill system_server process with signal SIGTERM
+     *       change return type from "void" to "bool" @{
+     */
+    static bool killProcessesWithOpenFiles(const char *path, int signal);
+    /* @} */
     static int getPid(const char *s);
     static int checkSymLink(int pid, const char *path, const char *name);
     static int checkFileMaps(int pid, const char *path);
@@ -36,7 +40,13 @@ private:
 
 extern "C" {
 #endif /* __cplusplus */
-	void vold_killProcessesWithOpenFiles(const char *path, int signal);
+    void vold_killProcessesWithOpenFiles(const char *path, int signal);
+    /* SPRD: Add for boot performance in cryptfs mode {@ */
+    int vold_getPid(const char *s);
+    void vold_getProcessName(int pid, char *buffer, size_t max);
+    int vold_checkFileDescriptorSymLinks(int pid, const char *mountPoint, char *openFilename, size_t max);
+    int vold_checkSymLink(int pid, const char *mountPoint, const char *name);
+    /* @} */
 #ifdef __cplusplus
 }
 #endif

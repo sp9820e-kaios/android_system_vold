@@ -45,7 +45,7 @@
 
 #include <logwrap/logwrap.h>
 
-#include "Vfat.h"
+#include "Exfat.h"
 #include "Utils.h"
 #include "VoldUtil.h"
 
@@ -53,16 +53,18 @@ using android::base::StringPrintf;
 
 namespace android {
 namespace vold {
-namespace vfat {
+namespace exfat {
 
-static const char* kMkfsPath = "/system/bin/newfs_msdos";
-static const char* kFsckPath = "/system/bin/fsck_msdos";
+
+static const char* kMkfsPath = "/system/bin/mkfsexfat";
+static const char* kFsckPath = "/system/bin/exfatfsck";
 
 bool IsSupported() {
     return access(kMkfsPath, X_OK) == 0
             && access(kFsckPath, X_OK) == 0
-            && IsFilesystemSupported("vfat");
+            && IsFilesystemSupported("exfat");
 }
+
 
 status_t Check(const std::string& source) {
     if (access(kFsckPath, X_OK)) {
@@ -75,12 +77,10 @@ status_t Check(const std::string& source) {
     do {
         std::vector<std::string> cmd;
         cmd.push_back(kFsckPath);
-        cmd.push_back("-p");
-        cmd.push_back("-f");
+        cmd.push_back("-R");
         cmd.push_back(source);
 retry:
-        // Fat devices are currently always untrusted
-        rc = ForkExecvp(cmd, sFsckUntrustedContext);
+        rc = ForkExecvp(cmd);
 
         if (rc < 0) {
             SLOGE("Filesystem check failed due to logwrap error");
@@ -93,18 +93,22 @@ retry:
             SLOGI("Filesystem check completed OK");
             return 0;
 
-        case 2:
-            SLOGE("Filesystem check failed (not a FAT filesystem)");
-            errno = ENODATA;
+        case 1:
+            SLOGE("Filesystem failed (unknown error outside exfat file system, e.g. library, system...");
+            errno = EIO;
             return -1;
 
-        case 4:
+        case 2:
+            SLOGE("Filesystem check failed. Invalid argument.");
+            errno = EIO;
+            return -1;
+
+        case 3:
             if (++pass <= 3) {
-                SLOGW("Filesystem modified - rechecking (pass %d)",
-                        pass);
+                SLOGW("Filesystem error is checked - rechecking (pass %d)",  pass);
                 goto retry;
             }
-            SLOGE("Failing check after too many rechecks");
+            SLOGE("Failing check after too many rechecks.");
             errno = EIO;
             return -1;
 
@@ -148,16 +152,15 @@ status_t Mount(const std::string& source, const std::string& target, bool ro,
         permMask = 0;
     }
 
-    sprintf(mountData,
-            "utf8,uid=%d,gid=%d,fmask=%o,dmask=%o,shortname=mixed",
+    sprintf(mountData, "uid=%d,gid=%d,fmask=%o,dmask=%o",
             ownerUid, ownerGid, permMask, permMask);
 
-    rc = mount(c_source, c_target, "vfat", flags, mountData);
+    rc = mount(c_source, c_target, "exfat", flags, mountData);
 
     if (rc && errno == EROFS) {
         SLOGE("%s appears to be a read only filesystem - retrying mount RO", c_source);
         flags |= MS_RDONLY;
-        rc = mount(c_source, c_target, "vfat", flags, mountData);
+        rc = mount(c_source, c_target, "exfat", flags, mountData);
     }
 
     if (rc == 0 && createLost) {
@@ -181,19 +184,10 @@ status_t Mount(const std::string& source, const std::string& target, bool ro,
 status_t Format(const std::string& source, unsigned int numSectors) {
     std::vector<std::string> cmd;
     cmd.push_back(kMkfsPath);
-    cmd.push_back("-F");
-    cmd.push_back("32");
-    cmd.push_back("-O");
-    cmd.push_back("android");
-    cmd.push_back("-c");
-    cmd.push_back("64");
-    cmd.push_back("-A");
-
     if (numSectors) {
-        cmd.push_back("-s");
+        cmd.push_back("-S");
         cmd.push_back(StringPrintf("%u", numSectors));
     }
-
     cmd.push_back(source);
 
     int rc = ForkExecvp(cmd);
@@ -214,6 +208,7 @@ status_t Format(const std::string& source, unsigned int numSectors) {
     return 0;
 }
 
-}  // namespace vfat
+
+}  // namespace exfat
 }  // namespace vold
 }  // namespace android

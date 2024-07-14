@@ -15,6 +15,7 @@
  */
 
 #include "fs/Vfat.h"
+#include "fs/Exfat.h"
 #include "PublicVolume.h"
 #include "Utils.h"
 #include "VolumeManager.h"
@@ -23,6 +24,8 @@
 #include <base/stringprintf.h>
 #include <base/logging.h>
 #include <cutils/fs.h>
+/* SPRD: add for physical internal SD */
+#include <cutils/properties.h>
 #include <private/android_filesystem_config.h>
 
 #include <fcntl.h>
@@ -37,9 +40,15 @@ using android::base::StringPrintf;
 namespace android {
 namespace vold {
 
+#define CARD_SIZE_32G (32*1024*1024*1024ULL)
+
 static const char* kFusePath = "/system/bin/sdcard";
 
 static const char* kAsecPath = "/mnt/secure/asec";
+
+/* SPRD: Add support for install apk to internal sdcard @{*/
+static const char* kInternalSdAsecPath = "/mnt/secure/internal-asec";
+/* @} */
 
 PublicVolume::PublicVolume(dev_t device) :
         VolumeBase(Type::kPublic), mDevice(device), mFusePid(0) {
@@ -52,6 +61,29 @@ PublicVolume::~PublicVolume() {
 
 status_t PublicVolume::readMetadata() {
     status_t res = ReadMetadataUntrusted(mDevPath, mFsType, mFsUuid, mFsLabel);
+    /* SPRD: add for physical internal SD @{ */
+    if (!VolumeManager::isInternalEmulated()
+            && getLinkName() == "sdcard0") {
+        // this is physical internal SD
+        LOG(VERBOSE) << StringPrintf("readMetadata()=%d, mFsType is %s, mFsUuid is %s, mFsLabel is %s",
+                                 res, mFsType.c_str(), mFsUuid.c_str(), mFsLabel.c_str());
+        if (res < 0) {
+            if (vfat::Format(mDevPath, 0)) {
+                LOG(ERROR) << getId() << " failed to format";
+            } else {
+                res = ReadMetadataUntrusted(mDevPath, mFsType, mFsUuid, mFsLabel);
+                LOG(VERBOSE) << StringPrintf("readMetadata()=%d, mFsType is %s, mFsUuid is %s, mFsLabel is %s",
+                                             res, mFsType.c_str(), mFsUuid.c_str(), mFsLabel.c_str());
+            }
+        }
+        if (mFsLabel == "") {
+            char value[PROPERTY_VALUE_MAX];
+            property_get("ro.internal.physical.name", value, "Spreadtrum");
+            mFsLabel = value;
+            LOG(VERBOSE) << StringPrintf("set physical internal mFsLabel as %s", value);
+        }
+    }
+    /* @} */
     notifyEvent(ResponseCode::VolumeFsTypeChanged, mFsType);
     notifyEvent(ResponseCode::VolumeFsUuidChanged, mFsUuid);
     notifyEvent(ResponseCode::VolumeFsLabelChanged, mFsLabel);
@@ -76,8 +108,18 @@ status_t PublicVolume::initAsecStage() {
             return -errno;
         }
     }
-
-    BindMount(securePath, kAsecPath);
+    /* SPRD: Add support for install apk to internal sdcard @{
+     * @orig    BindMount(securePath, kAsecPath);
+     */
+    if(getLinkName() == "sdcard0" || getLinkName() == "sdcard1"){
+    if (!VolumeManager::isInternalEmulated()
+            && getLinkName() == "sdcard0") {
+    	BindMount(securePath, kInternalSdAsecPath);
+    }else{
+        BindMount(securePath, kAsecPath);
+    }
+    }
+    /* @ */
 
     return OK;
 }
@@ -87,21 +129,39 @@ status_t PublicVolume::doCreate() {
 }
 
 status_t PublicVolume::doDestroy() {
+    /* SPRD: add for storage */
+    //property_set(StringPrintf("vold.%s.path", getLinkName().c_str()).c_str(), "");
     return DestroyDeviceNode(mDevPath);
 }
+
+/* SPRD: add for read storage metadata */
+status_t PublicVolume::doGetMetadata() {
+    readMetadata();
+    return OK;
+}
+/* @} */
 
 status_t PublicVolume::doMount() {
     // TODO: expand to support mounting other filesystems
     readMetadata();
 
-    if (mFsType != "vfat") {
+    if (mFsType == "exfat" && exfat::IsSupported()) {
+        LOG(VERBOSE) << getId() << " detects filesystem " << mFsType;
+    } else if (mFsType != "vfat") {
         LOG(ERROR) << getId() << " unsupported filesystem " << mFsType;
         return -EIO;
     }
 
-    if (vfat::Check(mDevPath)) {
-        LOG(ERROR) << getId() << " failed filesystem check";
-        return -EIO;
+    if (mFsType == "vfat") {
+        if (vfat::Check(mDevPath)) {
+            LOG(ERROR) << getId() << " failed filesystem check";
+            return -EIO;
+        }
+    } else if (mFsType == "exfat") {
+        if (exfat::Check(mDevPath)) {
+            LOG(ERROR) << getId() << " failed filesystem check";
+            return -EIO;
+        }
     }
 
     // Use UUID as stable name, if available
@@ -131,16 +191,38 @@ status_t PublicVolume::doMount() {
         return -errno;
     }
 
-    if (vfat::Mount(mDevPath, mRawPath, false, false, false,
-            AID_MEDIA_RW, AID_MEDIA_RW, 0007, true)) {
-        PLOG(ERROR) << getId() << " failed to mount " << mDevPath;
-        return -EIO;
+    /* SPRD: add for storage, create link for fuse path @{ */
+    if (!getLinkName().empty()) {
+        LOG(VERBOSE) << "create link for fuse path, linkName=" << getLinkName();
+        CreateSymlink(stableName, StringPrintf("/mnt/runtime/default/%s", getLinkName().c_str()));
+        CreateSymlink(stableName, StringPrintf("/mnt/runtime/read/%s", getLinkName().c_str()));
+        CreateSymlink(stableName, StringPrintf("/mnt/runtime/write/%s", getLinkName().c_str()));
+        property_set(StringPrintf("vold.%s.path", getLinkName().c_str()).c_str(),
+                StringPrintf("/storage/%s", stableName.c_str()).c_str());
+    }
+    /* @} */
+
+    if (mFsType == "vfat") {
+        if (vfat::Mount(mDevPath, mRawPath, false, false, false,
+                AID_MEDIA_RW, AID_MEDIA_RW, 0007, true)) {
+            PLOG(ERROR) << getId() << " failed to mount " << mDevPath;
+            return -EIO;
+        }
+    } else if (mFsType == "exfat") {
+        if (exfat::Mount(mDevPath, mRawPath, false, false, false,
+                AID_MEDIA_RW, AID_MEDIA_RW, 0007, true)) {
+            PLOG(ERROR) << getId() << " failed to mount " << mDevPath;
+            return -EIO;
+        }
     }
 
-    if (getMountFlags() & MountFlags::kPrimary) {
-        initAsecStage();
-    }
-
+   /* SPRD: Add support for install apk to internal sdcard @{
+    * @orig if (getMountFlags() & MountFlags::kPrimary) {
+    *         initAsecStage();
+    * }
+  */
+    initAsecStage();
+    /* @} */
     if (!(getMountFlags() & MountFlags::kVisible)) {
         // Not visible to apps, so no need to spin up FUSE
         return OK;
@@ -165,6 +247,8 @@ status_t PublicVolume::doMount() {
                     "-u", "1023", // AID_MEDIA_RW
                     "-g", "1023", // AID_MEDIA_RW
                     "-U", std::to_string(getMountUserId()).c_str(),
+                    // SPRD: add for not primary volume writable
+                    "-w",
                     mRawPath.c_str(),
                     stableName.c_str(),
                     NULL)) {
@@ -196,12 +280,33 @@ status_t PublicVolume::doUnmount() {
         mFusePid = 0;
     }
 
-    ForceUnmount(kAsecPath);
+    /* SPRD: Add support for install apk to internal sdcard @{
+     *@orig  ForceUnmount(kAsecPath);
+    */
+    if(getLinkName() == "sdcard0" || getLinkName() == "sdcard1"){
+    if (!VolumeManager::isInternalEmulated()
+            && getLinkName() == "sdcard0") {
+         ForceUnmount(kInternalSdAsecPath);
+    }else{
+         ForceUnmount(kAsecPath);
+    }
+    }
+     /* @ */
+    /* SPRD: add for storage, delete link for fuse path @{
+     *  */
+    if (!getLinkName().empty()) {
+        LOG(VERBOSE) << "delete link for fuse path, linkName=" << getLinkName();
+        DeleteSymlink(StringPrintf("/mnt/runtime/default/%s", getLinkName().c_str()));
+        DeleteSymlink(StringPrintf("/mnt/runtime/read/%s", getLinkName().c_str()));
+        DeleteSymlink(StringPrintf("/mnt/runtime/write/%s", getLinkName().c_str()));
+    }
+    /* @* } */
 
     ForceUnmount(mFuseDefault);
     ForceUnmount(mFuseRead);
     ForceUnmount(mFuseWrite);
     ForceUnmount(mRawPath);
+
 
     rmdir(mFuseDefault.c_str());
     rmdir(mFuseRead.c_str());
@@ -216,18 +321,75 @@ status_t PublicVolume::doUnmount() {
     return OK;
 }
 
+/* SPRD: add for UMS @{ */
+status_t PublicVolume::doShare(const std::string& massStorageFilePath) {
+    mMassStorageFilePath = massStorageFilePath;
+
+    std::string shareDevPath;
+    VolumeManager *vm = VolumeManager::Instance();
+    auto disk = vm->findDisk(getDiskId());
+    std::string partname = disk->getPartname();
+    if (partname.empty()) {
+        // external physical SD card, share whole disk
+        shareDevPath = disk->getDevPath();
+    } else {
+        // internal SD, just share a partition
+        shareDevPath = mDevPath;
+    }
+
+    return android::vold::WriteToFile(getId(), mMassStorageFilePath, shareDevPath, 0);
+}
+
+status_t PublicVolume::doUnshare() {
+    if (mMassStorageFilePath.empty()) {
+        LOG(WARNING) << "mass storage file path is empty";
+        return -1;
+    }
+    return android::vold::WriteToFile(getId(), mMassStorageFilePath, std::string(), 0);
+}
+
+status_t PublicVolume::doSetState(State state) {
+    if (getLinkName().empty()) {
+        LOG(WARNING) << "LinkName is empty, this is not a physical storage.";
+    } else {
+        property_set(StringPrintf("vold.%s.state", getLinkName().c_str()).c_str(), findState(state).c_str());
+    }
+    return OK;
+}
+/* @} */
+
 status_t PublicVolume::doFormat(const std::string& fsType) {
-    if (fsType == "vfat" || fsType == "auto") {
-        if (WipeBlockDevice(mDevPath) != OK) {
-            LOG(WARNING) << getId() << " failed to wipe";
-        }
-        if (vfat::Format(mDevPath, 0)) {
-            LOG(ERROR) << getId() << " failed to format";
-            return -errno;
-        }
+    int  fsVfat = 0, fsExfat = 0;
+    unsigned long long size64 = 0ull;
+
+    if (getBlkDeviceSize(mDevPath, size64) != OK) {
+        LOG(ERROR) << getId() << " failed to get size of block device.";
+    }
+
+    if ((fsType == "exfat" || (fsType == "auto" && size64 > CARD_SIZE_32G)) && exfat::IsSupported()) {
+        fsExfat = 1;
+        LOG(VERBOSE) << "Format to " << fsType << " for device block size " << size64;
+    } else if (fsType == "vfat"  || fsType == "auto") {
+        fsVfat = 1;
     } else {
         LOG(ERROR) << "Unsupported filesystem " << fsType;
         return -EINVAL;
+    }
+
+    if (WipeBlockDevice(mDevPath) != OK) {
+        LOG(WARNING) << getId() << " failed to wipe";
+    }
+
+    if (fsVfat) {
+        if (vfat::Format(mDevPath, 0)) {
+            LOG(ERROR) << getId() << " failed to format(vfat)";
+            return -errno;
+        }
+    } else {
+        if (exfat::Format(mDevPath, 0)) {
+            LOG(ERROR) << getId() << " failed to format(exfat)";
+            return -errno;
+        }
     }
 
     return OK;

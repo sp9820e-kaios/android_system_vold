@@ -60,6 +60,10 @@ public:
         kPrimary = 1 << 0,
         /* Flag that volume is visible to normal apps */
         kVisible = 1 << 1,
+        /* SPRD: add for emulated storage @{ */
+        /* Flag that volume is primary emulated storage */
+        kPriEmu = 1 << 2,
+        /* @} */
     };
 
     enum class State {
@@ -72,6 +76,9 @@ public:
         kUnmountable,
         kRemoved,
         kBadRemoval,
+        /* SPRD: add for UMS @{ */
+        kShared,
+        /* @} */
     };
 
     const std::string& getId() { return mId; }
@@ -83,12 +90,16 @@ public:
     State getState() { return mState; }
     const std::string& getPath() { return mPath; }
     const std::string& getInternalPath() { return mInternalPath; }
+    /* SPRD: get link name for mount path */
+    const std::string& getLinkName() { return mLinkname; }
 
     status_t setDiskId(const std::string& diskId);
     status_t setPartGuid(const std::string& partGuid);
     status_t setMountFlags(int mountFlags);
     status_t setMountUserId(userid_t mountUserId);
     status_t setSilent(bool silent);
+    /* SPRD: set link name for mount path */
+    status_t setLinkName(const std::string& linkName);
 
     void addVolume(const std::shared_ptr<VolumeBase>& volume);
     void removeVolume(const std::shared_ptr<VolumeBase>& volume);
@@ -100,6 +111,13 @@ public:
     status_t mount();
     status_t unmount();
     status_t format(const std::string& fsType);
+    /* SPRD: add for read storage metadata */
+    status_t getMetadata();
+    /* SPRD: add for UMS @{ */
+    status_t share(const std::string& massStorageFilePath);
+    status_t unshare();
+    std::string findState(State state);
+    /* @} */
 
 protected:
     explicit VolumeBase(Type type);
@@ -109,6 +127,13 @@ protected:
     virtual status_t doMount() = 0;
     virtual status_t doUnmount() = 0;
     virtual status_t doFormat(const std::string& fsType);
+    /* SPRD: add for read storage metadata */
+    virtual status_t doGetMetadata();
+    /* SPRD: add for UMS @{ */
+    virtual status_t doShare(const std::string& massStorageFilePath);
+    virtual status_t doUnshare();
+    virtual status_t doSetState(State state);
+    /* @} */
 
     status_t setId(const std::string& id);
     status_t setPath(const std::string& path);
@@ -140,6 +165,8 @@ private:
     std::string mInternalPath;
     /* Flag indicating that volume should emit no events */
     bool mSilent;
+    /* SPRD: link name for mount path */
+    std::string mLinkname;
 
     /* Volumes stacked on top of this volume */
     std::list<std::shared_ptr<VolumeBase>> mVolumes;

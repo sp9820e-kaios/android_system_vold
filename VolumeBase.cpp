@@ -46,6 +46,8 @@ VolumeBase::~VolumeBase() {
 
 void VolumeBase::setState(State state) {
     mState = state;
+    /* SPRD: add for storage */
+    doSetState(state);
     notifyEvent(ResponseCode::VolumeStateChanged, StringPrintf("%d", mState));
 }
 
@@ -98,6 +100,18 @@ status_t VolumeBase::setSilent(bool silent) {
     mSilent = silent;
     return OK;
 }
+
+/* SPRD: set link name for mount path @{ */
+status_t VolumeBase::setLinkName(const std::string& linkName) {
+    if (mCreated) {
+        LOG(WARNING) << getId() << " linkName change requires destroyed";
+        return -EBUSY;
+    }
+
+    mLinkname = linkName;
+    return OK;
+}
+/* @} */
 
 status_t VolumeBase::setId(const std::string& id) {
     if (mCreated) {
@@ -165,11 +179,41 @@ status_t VolumeBase::create() {
 
     mCreated = true;
     status_t res = doCreate();
+    /* SPRD: add this to fix a problem */
+    mState = State::kUnmounted;
+    /* SPRD: modify for storage manage @{
     notifyEvent(ResponseCode::VolumeCreated,
             StringPrintf("%d \"%s\" \"%s\"", mType, mDiskId.c_str(), mPartGuid.c_str()));
-    setState(State::kUnmounted);
+     */
+    notifyEvent(ResponseCode::VolumeCreated,
+            StringPrintf("%d \"%s\" \"%s\" \"%s\"", mType, mDiskId.c_str(), mPartGuid.c_str(), mLinkname.c_str()));
+    /* @} */
+    /* SPRD: add for bug 552546 @{
+     * @org setState(State::kUnmounted);
+    */
+    if (mState != State::kChecking) {
+        setState(State::kUnmounted);
+    }
+    /* @} */
+    /* SPRD: add for read storage metadata @{ */
+    if (res == OK) {
+        res = getMetadata();
+    }
+    /* @} */
     return res;
 }
+
+/* SPRD: add for read storage metadata @{ */
+status_t VolumeBase::getMetadata() {
+    CHECK(mCreated);
+
+    status_t res = doGetMetadata();
+    return res;
+}
+status_t VolumeBase::doGetMetadata() {
+    return OK;
+}
+/* @} */
 
 status_t VolumeBase::doCreate() {
     return OK;
@@ -181,9 +225,19 @@ status_t VolumeBase::destroy() {
     if (mState == State::kMounted) {
         unmount();
         setState(State::kBadRemoval);
-    } else {
-        setState(State::kRemoved);
-    }
+    /* SPRD: add for UMS @{ */
+    } else if (mState == State::kShared) {
+            doUnshare();
+            LOG(WARNING) << "The state is shared ,need to be unshared";
+            VolumeManager *vm = VolumeManager::Instance();
+            vm->mUmsSharedCount = 0;
+            vm->mUmsShareIndex = -1;
+            vm->mUmsSharePrepareCount = 0;
+            setState(State::kBadRemoval);
+    /* @} */
+        } else {
+            setState(State::kRemoved);
+        }
 
     notifyEvent(ResponseCode::VolumeDestroyed);
     status_t res = doDestroy();
@@ -232,10 +286,107 @@ status_t VolumeBase::unmount() {
     return res;
 }
 
+/* SPRD: add for UMS @{ */
+status_t VolumeBase::share(const std::string& massStorageFilePath) {
+    if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
+        LOG(WARNING) << getId() << " share requires state unmounted or unmountable";
+        return -EBUSY;
+    }
+
+    if (mType != Type::kPublic) {
+        LOG(WARNING) << getId() << " just public volume can be shared";
+        return -EBUSY;
+    }
+
+    status_t res = doShare(massStorageFilePath);
+    if (res == OK) {
+        setState(State::kShared);
+    }
+
+    return res;
+}
+
+status_t VolumeBase::doShare(const std::string& massStorageFilePath) {
+    return OK;
+}
+
+status_t VolumeBase::doSetState(State state) {
+    return OK;
+}
+
+status_t VolumeBase::unshare() {
+    if (mState != State::kShared) {
+        LOG(WARNING) << getId() << " unshare requires state shared";
+        return -EBUSY;
+    }
+
+    if (mType != Type::kPublic) {
+        LOG(WARNING) << getId() << " just public volume can be unshared";
+        return -EBUSY;
+    }
+
+    status_t res = doUnshare();
+    if (res == OK) {
+        setState(State::kUnmounted);
+    }
+
+    return res;
+}
+
+status_t VolumeBase::doUnshare() {
+    return OK;
+}
+
+std::string VolumeBase::findState(State state) {
+    std::string stateStr;
+    switch (state) {
+    case State::kUnmounted:
+        stateStr = "unmounted";
+        break;
+    case State::kChecking:
+        stateStr = "checking";
+        break;
+    case State::kMounted:
+        stateStr = "mounted";
+        break;
+    case State::kMountedReadOnly:
+        stateStr = "mounted_ro";
+        break;
+    case State::kFormatting:
+        stateStr = "formatting";
+        break;
+    case State::kEjecting:
+        stateStr = "ejecting";
+        break;
+    case State::kUnmountable:
+        stateStr = "unmountable";
+        break;
+    case State::kRemoved:
+        stateStr = "removed";
+        break;
+    case State::kBadRemoval:
+        stateStr = "bad_removal";
+        break;
+    case State::kShared:
+        stateStr = "shared";
+        break;
+    default:
+        stateStr = "unknown";
+    }
+    return stateStr;
+}
+/* @} */
+
 status_t VolumeBase::format(const std::string& fsType) {
     if (mState == State::kMounted) {
         unmount();
     }
+
+    /* SPRD: add for UMS @{ */
+    if (mState == State::kShared) {
+        unshare();
+    }
+    /* @} */
 
     if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
         LOG(WARNING) << getId() << " format requires state unmounted or unmountable";

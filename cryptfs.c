@@ -59,6 +59,8 @@
 #include "f2fs_sparseblock.h"
 #include "CheckBattery.h"
 #include "Process.h"
+#include <sys/stat.h>
+#include <dirent.h>
 
 #include <hardware/keymaster0.h>
 #include <hardware/keymaster1.h>
@@ -93,6 +95,10 @@
 
 #define RETRY_MOUNT_ATTEMPTS 10
 #define RETRY_MOUNT_DELAY_SECONDS 1
+
+#ifndef BLKFLSBUF
+#define BLKFLSBUF  _IO(0x12,97)	/* flush buffer cache */
+#endif
 
 char *me = "cryptfs";
 
@@ -1502,6 +1508,116 @@ static int create_encrypted_random_key(char *passwd, unsigned char *master_key, 
     return encrypt_master_key(passwd, salt, key_buf, master_key, crypt_ftr);
 }
 
+/* SPRD: Add for boot performance in cryptfs mode {@ */
+static int get_pid_by_name(const char *in_name){
+    DIR* dir;
+    struct dirent* de;
+    int pid = -1;
+    int rt_pid = -1;
+    char name[PATH_MAX];
+
+    if (!(dir = opendir("/proc"))){
+        SLOGE("opendir failed (%s)", strerror(errno));
+        return -1;
+    }
+    while ((de = readdir(dir))) {
+        pid = vold_getPid(de->d_name);
+        if (pid == -1) {
+            continue;
+        }
+        vold_getProcessName(pid, name, sizeof(name));
+        if (!strcmp(name, in_name)) {
+            rt_pid = pid;
+            break;
+        }
+    }
+    closedir(dir);
+    SLOGD("%s(): leave  pid = %d", __FUNCTION__, rt_pid);
+    return rt_pid;
+}
+
+static int get_open_process(const char *path){
+    DIR* dir;
+    struct dirent* de;
+    int rc = 0;
+    int need_kill_pid = -1;
+
+    need_kill_pid = get_pid_by_name("/system/bin/sprd_res_monitor");
+
+    if (!(dir = opendir("/proc"))){
+        SLOGE("opendir failed (%s)", strerror(errno));
+        return -1;
+    }
+
+    while ((de = readdir(dir))) {
+        int pid = vold_getPid(de->d_name);
+        char name[PATH_MAX];
+
+        if (pid == -1)
+            continue;
+        vold_getProcessName(pid, name, sizeof(name));
+        char openfile[PATH_MAX];
+
+        if (vold_checkFileDescriptorSymLinks(pid, path, openfile, sizeof(openfile))) {
+//        if (vold_checkAll(pid, name, path, openfile)) {
+
+            SLOGE("cryptfs Process %s (%d) has open file %s", name, pid, openfile);
+            if (!strcmp(name, "logcat")) {
+                SLOGD("will kill %s (%d)", name, pid);
+                kill(pid, SIGKILL);
+                rc = 1;
+                break;
+            }
+            if (!strcmp(name, "/system/bin/modemDriver_vpad_main")) {
+                SLOGD("will kill %s (%d)", name, pid);
+                kill(pid, SIGKILL);
+                rc = 1;
+                break;
+            }
+            if (!strcmp(name, "/system/bin/slog")) {
+                SLOGD("need_kill_pid = %d", need_kill_pid);
+                if (need_kill_pid != -1) {
+                    kill(need_kill_pid, SIGKILL);
+                    need_kill_pid = -1;
+                }
+                SLOGD("will kill %s (%d)", name, pid);
+                kill(pid, SIGKILL);
+                rc = 1;
+                break;
+            }
+            if (!strcmp(name, "/system/bin/ylog") || !strcmp(name, "ylog_benchmark_socket_server") || !strcmp(name, "sgm.cpu_memory")) {
+                SLOGD("need_kill_pid = %d", need_kill_pid);
+                if (need_kill_pid != -1) {
+                    kill(need_kill_pid, SIGKILL);
+                    need_kill_pid = -1;
+                }
+                SLOGD("will kill %s (%d)", name, pid);
+                kill(pid, SIGKILL);
+                rc = 1;
+                break;
+            }
+            if(!strcmp(name, "/system/bin/vold")){
+                if(!strcmp(openfile, "/data")){
+                    SLOGI("cryptfs vold fstrim /data, so sleep to wait!");
+                    sleep(15);
+                }
+            }
+        } else if (vold_checkSymLink(pid, path, "cwd")) {
+            SLOGE("Process %s (%d) has cwd within path %s", name, pid, path);
+            if (!strcmp(name, "/system/bin/gatekeeperd")) {
+                SLOGD("will kill process %s (%d)", name, pid);
+                kill(pid, SIGKILL);
+                rc = 1;
+                break;
+            }
+        }
+    }
+    closedir(dir);
+
+    return rc;
+}
+/* @} */
+
 int wait_and_unmount(const char *mountpoint, bool kill)
 {
     int i, err, rc;
@@ -1509,6 +1625,11 @@ int wait_and_unmount(const char *mountpoint, bool kill)
 
     /*  Now umount the tmpfs filesystem */
     for (i=0; i<WAIT_UNMOUNT_COUNT; i++) {
+        if (strcmp(mountpoint, DATA_MNT_POINT) == 0) {
+	            umount("/mnt/runtime/default/emulated");
+	            umount("/mnt/runtime/read/emulated");
+	            umount("/mnt/runtime/write/emulated");
+        }
         if (umount(mountpoint) == 0) {
             break;
         }
@@ -1524,6 +1645,10 @@ int wait_and_unmount(const char *mountpoint, bool kill)
 
         /* If allowed, be increasingly aggressive before the last two retries */
         if (kill) {
+            /* SPRD: Add for boot performance in cryptfs mode {@ */
+            if (get_open_process(mountpoint))
+                continue;
+            /* @} */
             if (i == (WAIT_UNMOUNT_COUNT - 3)) {
                 SLOGW("sending SIGHUP to processes with open files\n");
                 vold_killProcessesWithOpenFiles(mountpoint, SIGTERM);
@@ -2316,14 +2441,34 @@ static int flush_outstanding_data(struct encryptGroupsData* data)
         return -1;
     }
 
-    if (pwrite64(data->cryptofd, data->buffer,
-                 info.block_size * data->count, data->offset)
-        <= 0) {
-        SLOGE("Error writing crypto_blkdev %s for inplace encrypt",
-              data->crypto_blkdev);
-        return -1;
-    } else {
-      log_progress(data, false);
+    if (0 == data->offset) {
+        if (pwrite64(data->cryptofd, data->buffer, info.block_size * 1, data->offset)
+            <= 0) {
+            SLOGE("Error writing crypto_blkdev %s for inplace encrypt",
+                  data->crypto_blkdev);
+            return -1;
+        }
+        fsync(data->cryptofd);
+        ioctl(data->cryptofd, BLKFLSBUF, 0);
+        SLOGI("Encrypting superblock sector %" PRId64, data->offset);
+	if (data->count > 1) {
+            if (pwrite64(data->cryptofd, data->buffer + info.block_size, info.block_size * (data->count - 1), data->offset + (u64)info.block_size)
+                <= 0) {
+                    SLOGE("Error writing crypto_blkdev %s for inplace encrypt",data->crypto_blkdev);
+                    return -1;
+            }
+        }
+    }
+    else {
+        if (pwrite64(data->cryptofd, data->buffer,
+                     info.block_size * data->count, data->offset)
+            <= 0) {
+            SLOGE("Error writing crypto_blkdev %s for inplace encrypt",
+                  data->crypto_blkdev);
+            return -1;
+        } else {
+          log_progress(data, false);
+        }
     }
 
     data->count = 0;
@@ -2374,6 +2519,9 @@ static int encrypt_groups(struct encryptGroupsData* data)
 
         for (block = 0; block < block_count; block++) {
             int used = bitmap_get_bit(block_bitmap, block);
+            if (block && (block % 128 == 0)) {
+                fsync(data->cryptofd);
+            }
             update_progress(data, used);
             if (used) {
                 if (data->count == 0) {
@@ -2991,7 +3139,7 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, char *passwd,
     }
 
     /* Now unmount the /data partition. */
-    if (wait_and_unmount(DATA_MNT_POINT, false)) {
+    if (wait_and_unmount(DATA_MNT_POINT, true)) {
         if (allow_reboot) {
             goto error_shutting_down;
         } else {

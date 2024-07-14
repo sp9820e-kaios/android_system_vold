@@ -226,6 +226,12 @@ static int process_config(VolumeManager *vm) {
 
             std::string sysPattern(fstab->recs[i].blk_device);
             std::string nickname(fstab->recs[i].label);
+            /* SPRD: add for physical internal SD  @{ */
+            std::string partname;
+            if (fstab->recs[i].partnam != nullptr) {
+                partname = fstab->recs[i].partnam;
+            }
+            /* @} */
             int flags = 0;
 
             if (fs_mgr_is_encryptable(&fstab->recs[i])) {
@@ -237,8 +243,14 @@ static int process_config(VolumeManager *vm) {
                 flags |= android::vold::Disk::Flags::kDefaultPrimary;
             }
 
+            /* SPRD: modify for physical internal SD  @{
+             * @orig
             vm->addDiskSource(std::shared_ptr<VolumeManager::DiskSource>(
                     new VolumeManager::DiskSource(sysPattern, nickname, flags)));
+             */
+            vm->addDiskSource(std::shared_ptr<VolumeManager::DiskSource>(
+                    new VolumeManager::DiskSource(sysPattern, nickname, partname, flags)));
+            /* @} */
         }
     }
     property_set("vold.has_adoptable", has_adoptable ? "1" : "0");

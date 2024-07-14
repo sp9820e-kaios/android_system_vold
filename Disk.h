@@ -37,7 +37,12 @@ class VolumeBase;
  */
 class Disk {
 public:
+    /* SPRD: modify for physical internal SD @{
+     * @orig
     Disk(const std::string& eventPath, dev_t device, const std::string& nickname, int flags);
+     */
+    Disk(const std::string& eventPath, dev_t device, const std::string& nickname, const std::string& partname, int flags);
+    /* @} */
     virtual ~Disk();
 
     enum Flags {
@@ -58,6 +63,9 @@ public:
     const std::string& getEventPath() { return mEventPath; }
     const std::string& getSysPath() { return mSysPath; }
     const std::string& getDevPath() { return mDevPath; }
+    /* SPRD: add for UMS @{ */
+    const std::string& getPartname() { return mPartname; }
+    /* @} */
     dev_t getDevice() { return mDevice; }
     uint64_t getSize() { return mSize; }
     const std::string& getLabel() { return mLabel; }
@@ -115,6 +123,34 @@ private:
 
     int getMaxMinors();
 
+    /* SPRD: add for physical internal SD @{ */
+    /* we only mount one partition on this disk,
+     * which partition name is mPartname
+     */
+    std::string mPartname;
+    /* record the partVol used for formatting */
+    std::shared_ptr<VolumeBase> mThePartVol;
+    /* just used for format the part */
+    status_t formatThePart();
+    /* @} */
+
+    /* SPRD: add for set link name @{ */
+    status_t setVolLinkName(int partIndex, const std::shared_ptr<VolumeBase> vol);
+    /* @} */
+
+    /* SPRD: add for usb otg @{ */
+    // disk check thread id
+    pthread_t mDiskCheckThreadID;
+    // check device node
+    bool mCtlStopCheckThread;
+
+    /* check thread run function */
+    static void *diskCheck(void *arg);
+    /* start check disk thread */
+    void startDiskCheckThread();
+    /* stop check disk thread */
+    void stopDiskCheckThread();
+    /* @} */
     DISALLOW_COPY_AND_ASSIGN(Disk);
 };
 

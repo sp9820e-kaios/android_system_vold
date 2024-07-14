@@ -69,6 +69,14 @@ public:
     static const char *SEC_ASECDIR_INT;
     static const char *ASECDIR;
     static const char *LOOPDIR;
+    /* SPRD: support double sdcard Add support for install apk to internal sdcard @{ */
+    static const char *SEC_ASECDIR_INTSD;
+    /* @} */
+    /* SPRD: add for UMS @{ */
+    int                    mUmsSharePrepareCount;
+    int                    mUmsSharedCount;
+    int                    mUmsShareIndex;
+    /* @} */
 
 private:
     static VolumeManager *sInstance;
@@ -83,6 +91,14 @@ private:
     int                    mSavedDirtyRatio;
     int                    mUmsDirtyRatio;
 
+    /* SPRD: add for internal physical SD */
+    static int             sIsInternalEmulated;
+
+    /* SPRD: add for UMS @{ */
+    std::vector<std::string> mUMSFilePaths;
+    std::string            mSupportLunsFilePath;
+    /* @} */
+
 public:
     virtual ~VolumeManager();
 
@@ -96,9 +112,16 @@ public:
 
     class DiskSource {
     public:
+        /* SPRD: modify for physical internal SD @{
+         * @orig
         DiskSource(const std::string& sysPattern, const std::string& nickname, int flags) :
                 mSysPattern(sysPattern), mNickname(nickname), mFlags(flags) {
         }
+         */
+        DiskSource(const std::string& sysPattern, const std::string& nickname, const std::string& partname, int flags) :
+                mSysPattern(sysPattern), mNickname(nickname), mPartname(partname), mFlags(flags) {
+        }
+        /* @} */
 
         bool matches(const std::string& sysPath) {
             return !fnmatch(mSysPattern.c_str(), sysPath.c_str(), 0);
@@ -107,9 +130,14 @@ public:
         const std::string& getNickname() { return mNickname; }
         int getFlags() { return mFlags; }
 
+        /* SPRD: add for physical internal SD */
+        const std::string& getPartname() { return mPartname; }
+
     private:
         std::string mSysPattern;
         std::string mNickname;
+        /* SPRD: add for physical internal SD */
+        std::string mPartname;
         int mFlags;
     };
 
@@ -131,6 +159,15 @@ public:
 
     int setPrimary(const std::shared_ptr<android::vold::VolumeBase>& vol);
 
+    /* SPRD: add for emulated storage @{ */
+    int setEmulated(const std::shared_ptr<android::vold::VolumeBase>& vol);
+    int clearEmulated();
+    /* @} */
+
+    /* SPRD: add for internal physical SD @{ */
+    static bool isInternalEmulated();
+    /* @} */
+
     int remountUid(uid_t uid, const std::string& mode);
 
     /* Reset all internal state, typically during framework boot */
@@ -147,6 +184,12 @@ public:
                    const char *key, const int ownerUid, bool isExternal);
     int resizeAsec(const char *id, unsigned numSectors, const char *key);
     int finalizeAsec(const char *id);
+    /* SPRD: support double sdcard
+     * Add support for install apk to internal sdcard @{
+     */
+    int createAsec(const char *id, unsigned numSectors, const char *fstype,
+                       const char *key, const int ownerUid, bool isExternal, bool isForwardLocked);
+    /* @} */
 
     /**
      * Fixes ASEC permissions on a filesystem that has owners and permissions.
@@ -194,6 +237,13 @@ public:
      */
     int mkdirs(char* path);
 
+    /* SPRD: add for UMS @{ */
+    int prepareShare(int count);
+    int shareVolume(const std::shared_ptr<android::vold::VolumeBase>& vol);
+    int unshareVolume(const std::shared_ptr<android::vold::VolumeBase>& vol);
+    int unshareOver();
+    /* @} */
+
 private:
     VolumeManager();
     void readInitialState();
@@ -202,6 +252,11 @@ private:
     bool isLegalAsecId(const char *id) const;
 
     int linkPrimary(userid_t userId);
+
+    /* SPRD: add for emulated storage */
+    int linkEmulated(userid_t userId);
+
+    int linkInternalPrimary(userid_t userId);
 
     std::mutex mLock;
 
@@ -213,6 +268,8 @@ private:
 
     std::shared_ptr<android::vold::VolumeBase> mInternalEmulated;
     std::shared_ptr<android::vold::VolumeBase> mPrimary;
+    // SPRD: add for emulated storage
+    std::shared_ptr<android::vold::VolumeBase> mEmulated;
 };
 
 extern "C" {

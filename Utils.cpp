@@ -125,16 +125,53 @@ status_t ForceUnmount(const std::string& path) {
     }
     PLOG(WARNING) << "Failed to unmount " << path;
 
-    sleep(5);
+    /* SPRD: replace storage path to /storage @{ */
+    std::string storage_path = path;
+    std::string path_prefix = "/mnt/runtime/default";
+    std::size_t pos = storage_path.find(path_prefix);
+    LOG(WARNING) << "storage_path1= " + storage_path << ", pos=" << pos;
+    if (pos != std::string::npos) {
+        storage_path = storage_path.replace(pos, path_prefix.length(), "/storage");
+    }
+    path_prefix = "/mnt/runtime/write";
+    pos = storage_path.find(path_prefix);
+    LOG(WARNING) << "storage_path2= " + storage_path << ", pos=" << pos;
+    if (pos != std::string::npos) {
+        storage_path = storage_path.replace(pos, path_prefix.length(), "/storage");
+    }
+
+    const char* cpath2 = storage_path.c_str();
+    /* @} */
+    /* SPRD: add for unmount sdcard performance @{
+     * @orig sleep(5);
+     */
+    sleep(1);
+    /* @} */
+    /* SPRD: replace storage path to /storage @{
+     * @orig
     Process::killProcessesWithOpenFiles(cpath, SIGINT);
+     */
+    LOG(WARNING) << "killProcessesWithOpenFiles " + storage_path << " with SIGINT.";
+    Process::killProcessesWithOpenFiles(cpath2, SIGINT);
+    /* @} */
 
     if (!umount2(cpath, UMOUNT_NOFOLLOW) || errno == EINVAL || errno == ENOENT) {
         return OK;
     }
     PLOG(WARNING) << "Failed to unmount " << path;
 
-    sleep(5);
+    /* SPRD: add for unmount sdcard performance @{
+     * @orig sleep(5);
+     */
+    sleep(1);
+    /* @} */
+    /* SPRD: replace storage path to /storage @{
+     * @orig
     Process::killProcessesWithOpenFiles(cpath, SIGTERM);
+     */
+    LOG(WARNING) << "killProcessesWithOpenFiles " + storage_path << " with SIGTERM. ";
+    Process::killProcessesWithOpenFiles(cpath2, SIGTERM);
+    /* @} */
 
     if (!umount2(cpath, UMOUNT_NOFOLLOW) || errno == EINVAL || errno == ENOENT) {
         return OK;
@@ -142,13 +179,36 @@ status_t ForceUnmount(const std::string& path) {
     PLOG(WARNING) << "Failed to unmount " << path;
 
     sleep(5);
+    /* SPRD: replace storage path to /storage @{
+     * @orig
     Process::killProcessesWithOpenFiles(cpath, SIGKILL);
+     */
+    LOG(WARNING) << "killProcessesWithOpenFiles " + storage_path << " with SIGKILL. ";
+    Process::killProcessesWithOpenFiles(cpath2, SIGKILL);
+    /* @} */
 
     if (!umount2(cpath, UMOUNT_NOFOLLOW) || errno == EINVAL || errno == ENOENT) {
         return OK;
     }
     PLOG(ERROR) << "Failed to unmount " << path;
 
+    /* SPRD: add for unmount sdcard performance @{ */
+    sleep(8);
+    LOG(WARNING) << "killProcessesWithOpenFiles " + storage_path << " with SIGKILL again. ";
+    Process::killProcessesWithOpenFiles(cpath2, SIGKILL);
+    if (!umount2(cpath, UMOUNT_NOFOLLOW) || errno == EINVAL || errno == ENOENT) {
+        return OK;
+    }
+    PLOG(ERROR) << "Failed to unmount " << path;
+    /* @} */
+
+    /* SPRD: Lazy umount @{ */
+    if (!umount2(cpath, UMOUNT_NOFOLLOW|MNT_DETACH) || errno == EINVAL || errno == ENOENT) {
+        PLOG(WARNING) << "Success lazy unmount " << path;
+        return OK;
+    }
+    PLOG(ERROR) << "Failed to Lazy unmount " << path;
+    /* @} */
     return -errno;
 }
 
@@ -236,12 +296,12 @@ status_t ForkExecvp(const std::vector<std::string>& args, security_context_t con
 
     if (setexeccon(context)) {
         LOG(ERROR) << "Failed to setexeccon";
-        abort();
+//        abort();
     }
     status_t res = android_fork_execvp(argc, argv, NULL, false, true);
     if (setexeccon(nullptr)) {
         LOG(ERROR) << "Failed to setexeccon";
-        abort();
+//        abort();
     }
 
     free(argv);
@@ -268,17 +328,22 @@ status_t ForkExecvp(const std::vector<std::string>& args,
 
     if (setexeccon(context)) {
         LOG(ERROR) << "Failed to setexeccon";
-        abort();
+//        abort();
     }
     FILE* fp = popen(cmd.c_str(), "r");
     if (setexeccon(nullptr)) {
         LOG(ERROR) << "Failed to setexeccon";
-        abort();
+//        abort();
     }
 
     if (!fp) {
         PLOG(ERROR) << "Failed to popen " << cmd;
+        /* SPRD: modify for internal physical SD @{
+         * @orig
         return -errno;
+         */
+        goto err;
+        /* @} */
     }
     char line[1024];
     while (fgets(line, sizeof(line), fp) != nullptr) {
@@ -287,10 +352,22 @@ status_t ForkExecvp(const std::vector<std::string>& args,
     }
     if (pclose(fp) != 0) {
         PLOG(ERROR) << "Failed to pclose " << cmd;
+        /* SPRD: modify for internal physical SD @{
+         * @orig
         return -errno;
+         */
+        goto err;
+        /* @} */
     }
 
     return OK;
+    /* SPRD: add for internal physical SD @{ */
+err:
+    if (errno == OK) {
+        return -1;
+    }
+    return -errno;
+    /* @} */
 }
 
 pid_t ForkExecvpAsync(const std::vector<std::string>& args) {
@@ -525,6 +602,30 @@ done:
     return res;
 }
 
+status_t getBlkDeviceSize(const std::string& path, unsigned long long & size64) {
+    status_t res = -1;
+    const char* c_path = path.c_str();
+    unsigned long long card_size;
+
+    int fd = TEMP_FAILURE_RETRY(open(c_path, O_RDONLY));
+    if (fd == -1) {
+        PLOG(ERROR) << "Failed to open " << path;
+        goto done;
+    }
+
+    if ((ioctl(fd, BLKGETSIZE64, &card_size)) == -1) {
+        PLOG(ERROR) << "Failed to get size(64bits) of block device " << path;
+        goto done;
+    }
+
+    size64 = card_size;
+    res = 0;
+
+done:
+    close(fd);
+    return res;
+}
+
 std::string BuildKeyPath(const std::string& partGuid) {
     return StringPrintf("%s/expand_%s.key", kKeyPath, partGuid.c_str());
 }
@@ -544,6 +645,58 @@ std::string DefaultFstabPath() {
     property_get("ro.hardware", hardware, "");
     return StringPrintf("/fstab.%s", hardware);
 }
+
+/* SPRD: add for storage @{ */
+/*  create symlink  */
+status_t CreateSymlink(const std::string& source, const std::string& target) {
+    status_t res = 0;
+    remove(target.c_str());
+    LOG(INFO) << "create symlink " << target << "->" << source;
+    if (symlink(source.c_str(), target.c_str()) < 0) {
+        PLOG(ERROR)<< "Failed to create symlink " << target << "->" << source;
+        res = -errno;
+    }
+    return res;
+}
+
+/*  delete symlink  */
+status_t DeleteSymlink(const std::string& path) {
+    status_t res = 0;
+    LOG(INFO) << "delete symlink " << path;
+    if (remove(path.c_str()) < 0) {
+        PLOG(ERROR)<< "Failed to delete symlink " << path;
+        res = -errno;
+    }
+    return res;
+}
+
+/*  write string to file  */
+status_t WriteToFile(const std::string& preMsg, const std::string& file, const std::string& str, const char byte) {
+    int fd;
+
+    if ((fd = open(file.c_str(), O_WRONLY)) < 0) {
+        PLOG(ERROR) << preMsg << StringPrintf(" unable to open file (%s)", file.c_str());
+        return -EIO;
+    }
+
+    int writeRes = OK;
+    if (str.empty()) {
+        LOG(VERBOSE) << StringPrintf(" write byte num %d to file \'%s\'", byte, file.c_str());
+        writeRes = write(fd, &byte, 1);
+    } else {
+        LOG(VERBOSE) << StringPrintf(" write string \'%s\' to file \'%s\'", str.c_str(), file.c_str());
+        writeRes = write(fd, str.c_str(), str.length());
+    }
+    if (writeRes < 0) {
+        PLOG(ERROR) << preMsg << StringPrintf(" unable to write file (%s)", file.c_str());
+        close(fd);
+        return -EIO;
+    }
+
+    close(fd);
+    return OK;
+}
+/* @} */
 
 }  // namespace vold
 }  // namespace android

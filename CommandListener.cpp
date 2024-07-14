@@ -211,6 +211,12 @@ int CommandListener::VolumeCmd::runCommand(SocketClient *cli,
         int mountFlags = (argc > 3) ? atoi(argv[3]) : 0;
         userid_t mountUserId = (argc > 4) ? atoi(argv[4]) : -1;
 
+        //merge kaios begin
+        if ( strncmp(argv[2],"public:179",10) == 0) {
+              mountFlags |= android::vold::VolumeBase::MountFlags::kVisible;
+        }
+	 //merge kaios end
+
         vol->setMountFlags(mountFlags);
         vol->setMountUserId(mountUserId);
 
@@ -218,6 +224,11 @@ int CommandListener::VolumeCmd::runCommand(SocketClient *cli,
         if (mountFlags & android::vold::VolumeBase::MountFlags::kPrimary) {
             vm->setPrimary(vol);
         }
+        /* SPRD: add for emulated storage @{ */
+        if (vol->getType() == android::vold::VolumeBase::Type::kEmulated) {
+            vm->setEmulated(vol);
+        }
+        /* @} */
         return sendGenericOkFail(cli, res);
 
     } else if (cmd == "unmount" && argc > 2) {
@@ -269,6 +280,38 @@ int CommandListener::VolumeCmd::runCommand(SocketClient *cli,
         uid_t uid = atoi(argv[2]);
         std::string mode(argv[3]);
         return sendGenericOkFail(cli, vm->remountUid(uid, mode));
+
+        /* @SPRD: add for UMS @{ */
+    } else if (cmd == "pre_share" && argc > 2) {
+        // pre_share [count]
+        int count = atoi(argv[2]);
+        return sendGenericOkFail(cli, vm->prepareShare(count));
+
+    } else if (cmd == "share" && argc > 2) {
+        // share [volId]
+        std::string id(argv[2]);
+        auto vol = vm->findVolume(id);
+        if (vol == nullptr) {
+            return cli->sendMsg(ResponseCode::CommandSyntaxError, "Unknown volume", false);
+        }
+
+        return sendGenericOkFail(cli, vm->shareVolume(vol));
+
+    } else if (cmd == "unshare" && argc > 2) {
+        // unshare [volId]
+        std::string id(argv[2]);
+        auto vol = vm->findVolume(id);
+        if (vol == nullptr) {
+            return cli->sendMsg(ResponseCode::CommandSyntaxError, "Unknown volume", false);
+        }
+
+        return sendGenericOkFail(cli, vm->unshareVolume(vol));
+
+    } else if (cmd == "unshare_over") {
+        // unshare_over
+        return sendGenericOkFail(cli, vm->unshareOver());
+
+        /* @} */
     }
 
     return cli->sendMsg(ResponseCode::CommandSyntaxError, nullptr, false);
@@ -396,11 +439,41 @@ int CommandListener::AsecCmd::runCommand(SocketClient *cli,
     if (!strcmp(argv[1], "list")) {
         dumpArgs(argc, argv, -1);
 
-        listAsecsInDirectory(cli, VolumeManager::SEC_ASECDIR_EXT);
-        listAsecsInDirectory(cli, VolumeManager::SEC_ASECDIR_INT);
+        /* SPRD: support double sdcard add for avoiding system dump when firing UMS @{
+         @orig
+          listAsecsInDirectory(cli, VolumeManager::SEC_ASECDIR_EXT);
+          listAsecsInDirectory(cli, VolumeManager::SEC_ASECDIR_INT);
+         */
+        if ((argc != 2) && (argc != 4)) {
+            cli->sendMsg(ResponseCode::CommandSyntaxError, "Usage: asec list <externalStorage> <isInternalStorage>", false);
+            return 0;
+        }
+        if (argc == 2) {
+            listAsecsInDirectory(cli, VolumeManager::SEC_ASECDIR_EXT);
+            listAsecsInDirectory(cli,VolumeManager::SEC_ASECDIR_INTSD);
+            listAsecsInDirectory(cli, VolumeManager::SEC_ASECDIR_INT);
+        } else if (argc == 4) {
+            bool externalStorage = (atoi(argv[2]) == 1);
+            bool isInternlaSd = (atoi(argv[3]) == 1);
+            SLOGD("argc= %d",argc);
+            SLOGD("externalstorage= %d,isinternalsd=%d",externalStorage,isInternlaSd);
+             if ((externalStorage == true) && (isInternlaSd == false)) {
+                listAsecsInDirectory(cli, VolumeManager::SEC_ASECDIR_EXT);
+            } else if ((externalStorage == true) && (isInternlaSd == true)) {
+                listAsecsInDirectory(cli,VolumeManager::SEC_ASECDIR_INTSD);
+            } else if ((externalStorage == false) && (isInternlaSd == false)) {
+                listAsecsInDirectory(cli, VolumeManager::SEC_ASECDIR_INT);
+            }
+        }
+        /* @} */
     } else if (!strcmp(argv[1], "create")) {
         dumpArgs(argc, argv, 5);
+        /* SPRD: support double sdcard Add support for install apk to internal sdcard @{
+         @orig
         if (argc != 8) {
+         */
+        if (argc != 8 && argc != 9) {
+        /* @} */
             cli->sendMsg(ResponseCode::CommandSyntaxError,
                     "Usage: asec create <container-id> <size_mb> <fstype> <key> <ownerUid> "
                     "<isExternal>", false);
@@ -409,7 +482,20 @@ int CommandListener::AsecCmd::runCommand(SocketClient *cli,
 
         unsigned int numSectors = (atoi(argv[3]) * (1024 * 1024)) / 512;
         const bool isExternal = (atoi(argv[7]) == 1);
+        /* SPRD: support double sdcard Add support for install apk to internal sdcard @{
+         @orig
         rc = vm->createAsec(argv[2], numSectors, argv[4], argv[5], atoi(argv[6]), isExternal);
+         */
+        if (argc == 8) {
+            rc = vm->createAsec(argv[2], numSectors, argv[4], argv[5],
+                    atoi(argv[6]), isExternal);
+        } else if (argc == 9) {
+            const bool isForwardLocked = (atoi(argv[8]) == 1);
+            rc = vm->createAsec(argv[2], numSectors, argv[4], argv[5],
+                    atoi(argv[6]), isExternal, isForwardLocked);
+        }
+        /* @} */
+
     } else if (!strcmp(argv[1], "resize")) {
         dumpArgs(argc, argv, -1);
         if (argc != 5) {

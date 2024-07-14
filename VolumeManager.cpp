@@ -62,6 +62,10 @@
 #include "cryptfs.h"
 
 #define MASS_STORAGE_FILE_PATH  "/sys/class/android_usb/android0/f_mass_storage/lun/file"
+/* SPRD: add for UMS @{ */
+#define MASS_STORAGE_FILE_PATH1  "/sys/class/android_usb/android0/f_mass_storage/lun1/file"
+#define SUPPORT_LUNS_FILE_PATH "/sys/class/android_usb/android0/f_mass_storage/board_support_luns"
+/* @} */
 
 #define ROUND_UP_POWER_OF_2(number, po2) (((!!(number & ((1U << po2) - 1))) << po2)\
                                          + (number & (~((1U << po2) - 1))))
@@ -77,6 +81,10 @@ const char *VolumeManager::SEC_ASECDIR_EXT   = "/mnt/secure/asec";
  * Path to internal storage where *only* root can access ASEC image files
  */
 const char *VolumeManager::SEC_ASECDIR_INT   = "/data/app-asec";
+
+/* SPRD: support double sdcard Add support for install apk to internal sdcard @{ */
+const char *VolumeManager::SEC_ASECDIR_INTSD   = "/mnt/secure/internal-asec";
+/* @} */
 
 /*
  * Path to where secure containers are mounted
@@ -209,6 +217,15 @@ VolumeManager::VolumeManager() {
     mSavedDirtyRatio = -1;
     // set dirty ratio to 0 when UMS is active
     mUmsDirtyRatio = 0;
+
+    /* SPRD: add for UMS @{ */
+    mUMSFilePaths.push_back(std::string(MASS_STORAGE_FILE_PATH));
+    mUMSFilePaths.push_back(std::string(MASS_STORAGE_FILE_PATH1));
+    mSupportLunsFilePath = std::string(SUPPORT_LUNS_FILE_PATH);
+    mUmsShareIndex = -1;
+    mUmsSharePrepareCount = 0;
+    mUmsSharedCount = 0;
+    /* @} */
 }
 
 VolumeManager::~VolumeManager() {
@@ -267,6 +284,19 @@ int VolumeManager::start() {
     return 0;
 }
 
+/* SPRD: add for internal physical SD @{ */
+int VolumeManager::sIsInternalEmulated = -1;
+bool VolumeManager::isInternalEmulated() {
+    if (sIsInternalEmulated == -1) {
+        char value[PROPERTY_VALUE_MAX];
+        property_get("sys.internal.emulated", value, "1");
+        sIsInternalEmulated = atoi(value);
+        LOG(VERBOSE) << "sIsInternalEmulated is " << sIsInternalEmulated;
+    }
+
+    return (sIsInternalEmulated == 1);
+}
+
 int VolumeManager::stop() {
     CHECK(mInternalEmulated != nullptr);
     mInternalEmulated->destroy();
@@ -305,8 +335,14 @@ void VolumeManager::handleBlockEvent(NetlinkEvent *evt) {
                     flags |= android::vold::Disk::Flags::kUsb;
                 }
 
+                /* SPRD: modify for physical internal SD @{
+                 * @orig
                 auto disk = new android::vold::Disk(eventPath, device,
                         source->getNickname(), flags);
+                 */
+                auto disk = new android::vold::Disk(eventPath, device,
+                        source->getNickname(), source->getPartname(), flags);
+                /* @} */
                 disk->create();
                 mDisks.push_back(std::shared_ptr<android::vold::Disk>(disk));
                 break;
@@ -412,6 +448,44 @@ int VolumeManager::forgetPartition(const std::string& partGuid) {
     return 0;
 }
 
+/* SPRD: add for emulated storage @{ */
+int VolumeManager::linkEmulated(userid_t userId) {
+    if (mEmulated == nullptr
+        || mEmulated->getType() != android::vold::VolumeBase::Type::kEmulated) {
+        return -1;
+    }
+    std::string source(StringPrintf("%s/%d", mEmulated->getPath().c_str(), userId));
+    fs_prepare_dir(source.c_str(), 0755, AID_ROOT, AID_ROOT);
+
+    std::string target(StringPrintf("/mnt/user/%d/emulated", userId));
+    if (TEMP_FAILURE_RETRY(unlink(target.c_str()))) {
+        if (errno != ENOENT) {
+            SLOGW("Failed to unlink %s: %s", target.c_str(), strerror(errno));
+        }
+    }
+    LOG(DEBUG) << "Linking " << source << " to " << target;
+    if (TEMP_FAILURE_RETRY(symlink(source.c_str(), target.c_str()))) {
+        SLOGW("Failed to link %s to %s: %s", source.c_str(), target.c_str(),
+                strerror(errno));
+        return -errno;
+    }
+    return 0;
+}
+/* @} */
+
+int VolumeManager::setEmulated(const std::shared_ptr<android::vold::VolumeBase>& vol) {
+    mEmulated = vol;
+    for (userid_t userId : mStartedUsers) {
+        linkEmulated(userId);
+    }
+    return 0;
+}
+int VolumeManager::clearEmulated() {
+    mEmulated.reset();
+    return 0;
+}
+/* @} */
+
 int VolumeManager::linkPrimary(userid_t userId) {
     std::string source(mPrimary->getPath());
     if (mPrimary->getType() == android::vold::VolumeBase::Type::kEmulated) {
@@ -452,11 +526,56 @@ int VolumeManager::onUserStarted(userid_t userId) {
     fs_prepare_dir(path.c_str(), 0755, AID_ROOT, AID_ROOT);
 
     mStartedUsers.insert(userId);
+    LOG(DEBUG) << "onUserStarted mPrimary=" << mPrimary;
+    LOG(DEBUG) << "onUserStarted mEmulated=" << mEmulated;
     if (mPrimary) {
+        // SPRD: add for emulated
+        linkEmulated(userId);
         linkPrimary(userId);
+    /* SPRD: add for external primary storage @{ */
+    } else if (mEmulated) {
+        linkInternalPrimary(userId);
+    /* @} */
     }
     return 0;
 }
+
+/* SPRD: add for external primary storage @{ */
+int VolumeManager::linkInternalPrimary(userid_t userId) {
+    if (mEmulated == nullptr
+            || mEmulated->getType() != android::vold::VolumeBase::Type::kEmulated) {
+        return -1;
+    }
+    std::string source(StringPrintf("%s/%d", mEmulated->getPath().c_str(), userId));
+    fs_prepare_dir(source.c_str(), 0755, AID_ROOT, AID_ROOT);
+
+    std::string target(StringPrintf("/mnt/user/%d/emulated", userId));
+    if (TEMP_FAILURE_RETRY(unlink(target.c_str()))) {
+        if (errno != ENOENT) {
+            SLOGW("Failed to unlink %s: %s", target.c_str(), strerror(errno));
+        }
+    }
+    LOG(DEBUG)<< "Linking " << source << " to " << target;
+    if (TEMP_FAILURE_RETRY(symlink(source.c_str(), target.c_str()))) {
+        SLOGW("Failed to link %s to %s: %s", source.c_str(), target.c_str(), strerror(errno));
+        return -errno;
+    }
+
+    std::string targetPrimary(StringPrintf("/mnt/user/%d/primary", userId));
+    if (TEMP_FAILURE_RETRY(unlink(targetPrimary.c_str()))) {
+        if (errno != ENOENT) {
+            SLOGW("Failed to unlink %s: %s", targetPrimary.c_str(), strerror(errno));
+        }
+    }
+    LOG(DEBUG) << "Linking Primary " << target << " to " << targetPrimary;
+    if (TEMP_FAILURE_RETRY(symlink(target.c_str(), targetPrimary.c_str()))) {
+        SLOGW("Failed to link %s to %s: %s", target.c_str(), targetPrimary.c_str(),
+                strerror(errno));
+        return -errno;
+    }
+    return 0;
+}
+/* @} */
 
 int VolumeManager::onUserStopped(userid_t userId) {
     mStartedUsers.erase(userId);
@@ -635,6 +754,8 @@ int VolumeManager::reset() {
     }
     mAddedUsers.clear();
     mStartedUsers.clear();
+    /* SPRD: add for internal physical SD */
+    sIsInternalEmulated = -1;
     return 0;
 }
 
@@ -769,6 +890,13 @@ int VolumeManager::getAsecFilesystemPath(const char *id, char *buffer, int maxle
 
 int VolumeManager::createAsec(const char *id, unsigned int numSectors, const char *fstype,
         const char *key, const int ownerUid, bool isExternal) {
+/* SPRD: support double sdcard Add support for install apk to internal sdcard @{ */
+    return createAsec(id, numSectors, fstype, key, ownerUid, isExternal, false);
+}
+
+int VolumeManager::createAsec(const char *id, unsigned int numSectors, const char *fstype,
+        const char *key, const int ownerUid, bool isExternal, bool isForwardLocked) {
+/* @} */
     struct asec_superblock sb;
     memset(&sb, 0, sizeof(sb));
 
@@ -805,12 +933,21 @@ int VolumeManager::createAsec(const char *id, unsigned int numSectors, const cha
     if (!findAsec(id, asecFileName, sizeof(asecFileName))) {
         SLOGE("ASEC file '%s' currently exists - destroy it first! (%s)",
                 asecFileName, strerror(errno));
+        /* SPRD: support double sdcard add for solving not able to install apk to sd card at special situation @{
+         * @orig
         errno = EADDRINUSE;
         return -1;
+         */
+        destroyAsec(id, true);
+        /* @} */
     }
-
+    /* SPRD: support double sdcard Add support for install apk to internal sdcard @{
+     * @orig
     const char *asecDir = isExternal ? VolumeManager::SEC_ASECDIR_EXT : VolumeManager::SEC_ASECDIR_INT;
-
+     */
+    const char *asecDir = isExternal ? VolumeManager::SEC_ASECDIR_EXT : (isForwardLocked ? VolumeManager::SEC_ASECDIR_INT : VolumeManager::SEC_ASECDIR_INTSD);
+    SLOGW("create asec asecDir = %s \n", asecDir);
+    /* @} */
     int written = snprintf(asecFileName, sizeof(asecFileName), "%s/%s.asec", asecDir, id);
     if ((written < 0) || (size_t(written) >= sizeof(asecFileName))) {
         errno = EINVAL;
@@ -820,8 +957,13 @@ int VolumeManager::createAsec(const char *id, unsigned int numSectors, const cha
     if (!access(asecFileName, F_OK)) {
         SLOGE("ASEC file '%s' currently exists - destroy it first! (%s)",
                 asecFileName, strerror(errno));
+        /* SPRD: support double sdcard add for solving not able to install apk to sd card at special situation @{
+         * @orig
         errno = EADDRINUSE;
         return -1;
+         */
+        destroyAsec(id, true);
+        /* @} */
     }
 
     unsigned numImgSectors;
@@ -1420,6 +1562,9 @@ int VolumeManager::unmountLoopImage(const char *id, const char *idHash,
     }
 
     int i, rc;
+    /* SPRD: support double sdcard do not kill system_server process with signal SIGTERM@{ */
+    int killsystem = 0;
+     /* @} */
     for (i = 1; i <= UNMOUNT_RETRIES; i++) {
         rc = umount(mountPoint);
         if (!rc) {
@@ -1441,8 +1586,17 @@ int VolumeManager::unmountLoopImage(const char *id, const char *idHash,
             else if (i > (UNMOUNT_RETRIES - 3))
                 signal = SIGTERM;
         }
-
+        /* SPRD: support double sdcard do not kill system_server process with signal SIGTERM @{
+         * @orig
         Process::killProcessesWithOpenFiles(mountPoint, signal);
+         */
+        if(!Process::killProcessesWithOpenFiles(mountPoint, signal)){
+            if(killsystem <= 2){
+                i --;
+                killsystem ++;
+            }
+        }
+        /* @} */
         usleep(UNMOUNT_SLEEP_BETWEEN_RETRY_MS);
     }
 
@@ -1609,6 +1763,10 @@ int VolumeManager::findAsec(const char *id, char *asecPath, size_t asecPathLen,
         dir = VolumeManager::SEC_ASECDIR_INT;
     } else if (isAsecInDirectory(VolumeManager::SEC_ASECDIR_EXT, asecName)) {
         dir = VolumeManager::SEC_ASECDIR_EXT;
+    /* SPRD: support double sdcard Add support for install apk to internal sdcard @{ */
+    } else  if (isAsecInDirectory(VolumeManager::SEC_ASECDIR_INTSD, asecName)) {
+        dir = VolumeManager::SEC_ASECDIR_INTSD;
+    /* @} */
     } else {
         free(asecName);
         return -1;
@@ -1889,3 +2047,94 @@ int VolumeManager::mkdirs(char* path) {
         return -EINVAL;
     }
 }
+
+/* SPRD: add for UMS @{ */
+int VolumeManager::prepareShare(int count) {
+    if (mUmsShareIndex >= 0 || mUmsSharePrepareCount > 0) {
+        SLOGE("prepare share done, can not do it again");
+        return -EINVAL;
+    }
+
+    int maxUmsCount = mUMSFilePaths.size();
+    if (count > maxUmsCount) {
+        SLOGW("prepare to share %d volumes, but max ums paths count is %d", count, maxUmsCount);
+        count = maxUmsCount;
+    }
+
+    int res = android::OK;
+    res = android::vold::WriteToFile(
+              std::string("prepare share"),
+              mSupportLunsFilePath,
+              StringPrintf("%d", count),
+              0);
+
+    if (res == android::OK) {
+        mUmsShareIndex = 0;
+        mUmsSharePrepareCount = count;
+        mUmsSharedCount = 0;
+    }
+    return res;
+}
+
+int VolumeManager::shareVolume(const std::shared_ptr<android::vold::VolumeBase>& vol) {
+    if (mUmsShareIndex < 0 || mUmsSharePrepareCount == 0) {
+        SLOGE("share volume no prapare, please prepare share first");
+        return -EINVAL;
+    }
+
+    if (mUmsShareIndex >= mUmsSharePrepareCount) {
+        SLOGE("shared too more volumes, total:%d, index:%d", mUmsSharePrepareCount, mUmsShareIndex);
+        return -EINVAL;
+    }
+
+    auto massStorageFilePath = mUMSFilePaths.at(mUmsShareIndex);
+    int res = vol->share(massStorageFilePath);
+    if (res == android::OK) {
+        mUmsShareIndex ++;
+        mUmsSharedCount ++;
+    }
+
+    return res;
+}
+
+int VolumeManager::unshareVolume(const std::shared_ptr<android::vold::VolumeBase>& vol) {
+    if (mUmsShareIndex < 0 || mUmsSharePrepareCount == 0) {
+        SLOGE("unshare volume no prapare, please prepare share first");
+        return -EINVAL;
+    }
+
+    int res = vol->unshare();
+    if (res == android::OK) {
+        mUmsSharedCount --;
+    }
+
+    return res;
+}
+
+int VolumeManager::unshareOver() {
+    if (mUmsShareIndex < 0 || mUmsSharePrepareCount == 0) {
+        SLOGE("unshare over no prapare, please prepare share first");
+        return -EINVAL;
+    }
+
+    if (mUmsSharedCount > 0) {
+        SLOGE("not all shared volume unshared, can not do this");
+        return -EINVAL;
+    }
+
+    int res = android::OK;
+
+    res = android::vold::WriteToFile(
+              std::string("prepare share"),
+              mSupportLunsFilePath,
+              std::string("0"),
+              0);
+
+    if (res == android::OK) {
+        mUmsShareIndex = -1;
+        mUmsSharePrepareCount = 0;
+    }
+
+    return res;
+}
+/* @} */
